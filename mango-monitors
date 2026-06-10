@@ -14,9 +14,9 @@ How it works:
   * Saving writes a managed block of `monitorrule=` lines into
     ~/.config/mango/config.conf, between a pair of marker comments, and backs
     the file up the first time it touches it.
-  * Apply runs `mmsg -d reload_config`, which makes mango re-read the config and
-    commit the new geometry. Disabled outputs are turned off with
-    `mmsg -d disable_monitor,NAME` and persisted as a small exec-once line so
+  * Apply runs `mmsg -s -d reload_config`, which makes mango re-read the config
+    and commit the new geometry. Disabled outputs are turned off with
+    `mmsg -s -d disable_monitor,NAME` and persisted as a small exec-once line so
     they stay off after a restart.
   * Hotplugging is handled by polling `mmsg -O` every couple of seconds; when an
     output appears or disappears the layout updates without losing the edits
@@ -356,7 +356,7 @@ def build_block(monitors):
         if not m.enabled:
             # persist disable across restarts; small delay so output exists
             lines.append(
-                f"exec-once=sh -c 'sleep 1; mmsg -d disable_monitor,{m.name}'"
+                f"exec-once=sh -c 'sleep 1; mmsg -s -d disable_monitor,{m.name}'"
             )
     lines.append(END)
     return "\n".join(lines) + "\n"
@@ -385,11 +385,11 @@ def write_config(monitors):
 def apply_live(monitors):
     for m in monitors:
         if m.enabled:
-            run(["mmsg", "-d", f"enable_monitor,{m.name}"])
-    run(["mmsg", "-d", "reload_config"])
+            run(["mmsg", "-s", "-d", f"enable_monitor,{m.name}"])
+    run(["mmsg", "-s", "-d", "reload_config"])
     for m in monitors:
         if not m.enabled:
-            run(["mmsg", "-d", f"disable_monitor,{m.name}"])
+            run(["mmsg", "-s", "-d", f"disable_monitor,{m.name}"])
 
 
 def normalize(monitors):
