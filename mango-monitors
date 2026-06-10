@@ -1,0 +1,1072 @@
+#!/usr/bin/env python3
+"""
+mango-monitors — a small GTK GUI for arranging displays under MangoWM.
+
+Drag the monitors around to position them, pick a resolution / refresh rate /
+scale / rotation, enable or disable an output, then hit Apply (live) or Save
+(just write it to the config).
+
+How it works:
+
+  * Discovery reads `wlr-randr` for the live state of every output (modes,
+    position, scale, transform, adaptive sync) and falls back to `wayland-info`
+    if wlr-randr isn't installed. Output names come from `mmsg -O`.
+  * Saving writes a managed block of `monitorrule=` lines into
+    ~/.config/mango/config.conf, between a pair of marker comments, and backs
+    the file up the first time it touches it.
+  * Apply runs `mmsg -d reload_config`, which makes mango re-read the config and
+    commit the new geometry. Disabled outputs are turned off with
+    `mmsg -d disable_monitor,NAME` and persisted as a small exec-once line so
+    they stay off after a restart.
+  * Hotplugging is handled by polling `mmsg -O` every couple of seconds; when an
+    output appears or disappears the layout updates without losing the edits
+    you've already made.
+
+Only depends on PyGObject (GTK4 + libadwaita). Everything else is stdlib.
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, GLib, Gtk, Pango  # noqa: E402
+
+CONFIG = os.path.expanduser("~/.config/mango/config.conf")
+BEGIN = "# >>> mango-monitors (managed) — do not edit by hand >>>"
+END = "# <<< mango-monitors (managed) <<<"
+
+# Canvas colours. These are tuned for a light background; tweak them if you
+# run a dark theme.
+ACCENT = (0x2E / 255, 0x7D / 255, 0xE9 / 255)        # selected monitor
+ACCENT_DIM = (0xC4 / 255, 0xC8 / 255, 0xDA / 255)    # idle border
+CANVAS_BG = (0xE9 / 255, 0xE9 / 255, 0xED / 255)     # background
+DISABLED = (0xB0 / 255, 0xB0 / 255, 0xB8 / 255)
+
+# transform code -> human label.  Codes match mango's `rr` (wl_output transform).
+TRANSFORMS = [
+    (0, "Normal"),
+    (1, "90° (counter-clockwise)"),
+    (2, "180°"),
+    (3, "270° (counter-clockwise)"),
+    (4, "Flipped"),
+    (5, "Flipped + 90°"),
+    (6, "Flipped + 180°"),
+    (7, "Flipped + 270°"),
+]
+ROTATED = {1, 3, 5, 7}  # transforms that swap width/height
+
+SNAP = 40  # snapping threshold, in layout (logical) pixels
+
+
+def run(cmd):
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=8
+        ).stdout
+    except Exception:
+        return ""
+
+
+class Monitor:
+    def __init__(self, name):
+        self.name = name
+        self.make = ""
+        self.model = ""
+        self.serial = ""
+        self.desc = name
+        # mode (unrotated physical pixels)
+        self.width = 1920
+        self.height = 1080
+        self.refresh = 60.0
+        self.native = (1920, 1080, 60.0)  # detected current mode
+        self.modes = []  # [(w, h, refresh), ...] from wlr-randr, best-first
+        self.scale = 1.0
+        self.transform = 0
+        self.vrr = 0
+        self.enabled = True
+        self.x = 0
+        self.y = 0
+
+    # logical size in the layout (after scale + rotation)
+    def logical_size(self):
+        w, h = self.width, self.height
+        if self.transform in ROTATED:
+            w, h = h, w
+        return (round(w / self.scale), round(h / self.scale))
+
+    def is_custom_mode(self):
+        return (self.width, self.height, round(self.refresh)) != (
+            self.native[0], self.native[1], round(self.native[2])
+        )
+
+    def rule_line(self):
+        parts = [
+            # output names are simple (alnum + hyphen); anchor without escaping
+            # so the line matches mango's documented ^NAME$ regex style.
+            f"name:^{self.name}$",
+            f"width:{self.width}",
+            f"height:{self.height}",
+            f"refresh:{self.refresh:g}",
+            f"x:{self.x}",
+            f"y:{self.y}",
+            f"scale:{self.scale:g}",
+            f"rr:{self.transform}",
+            f"vrr:{self.vrr}",
+        ]
+        if self.is_custom_mode():
+            parts.append("custom:1")
+        return "monitorrule=" + ",".join(parts)
+
+
+# ----------------------------------------------------------------------------
+# Discovery
+# ----------------------------------------------------------------------------
+
+def output_names():
+    return [n.strip() for n in run(["mmsg", "-O"]).splitlines() if n.strip()]
+
+
+def discover():
+    return list(discover_map().values())
+
+
+TRANSFORM_NAMES = {
+    "normal": 0, "90": 1, "180": 2, "270": 3,
+    "flipped": 4, "flipped-90": 5, "flipped-180": 6, "flipped-270": 7,
+}
+
+
+def parse_wlr_randr():
+    """Authoritative live state per output: identity, modes, geometry."""
+    text = run(["wlr-randr"])
+    if not text.strip():
+        return {}
+    outs = {}
+    cur = None
+    in_modes = False
+    for line in text.splitlines():
+        if line and not line[0].isspace():
+            name = line.split()[0]
+            cur = {"name": name, "modes": [], "enabled": True}
+            desc = re.search(r'"(.*)"', line)
+            cur["desc"] = desc.group(1) if desc else name
+            outs[name] = cur
+            in_modes = False
+            continue
+        if cur is None:
+            continue
+        s = line.strip()
+        if s.startswith("Make:"):
+            cur["make"] = s.split(":", 1)[1].strip()
+        elif s.startswith("Model:"):
+            cur["model"] = s.split(":", 1)[1].strip()
+        elif s.startswith("Serial:"):
+            cur["serial"] = s.split(":", 1)[1].strip()
+        elif s.startswith("Enabled:"):
+            cur["enabled"] = s.split(":", 1)[1].strip().lower() == "yes"
+        elif s == "Modes:":
+            in_modes = True
+        elif s.startswith("Position:"):
+            in_modes = False
+            m = re.search(r"(-?\d+),(-?\d+)", s)
+            if m:
+                cur["pos"] = (int(m.group(1)), int(m.group(2)))
+        elif s.startswith("Transform:"):
+            cur["transform"] = TRANSFORM_NAMES.get(
+                s.split(":", 1)[1].strip(), 0)
+        elif s.startswith("Scale:"):
+            try:
+                cur["scale"] = round(float(s.split(":", 1)[1].strip()), 2)
+            except ValueError:
+                pass
+        elif s.startswith("Adaptive Sync:"):
+            cur["vrr"] = 1 if "enabled" in s.lower() else 0
+        elif in_modes:
+            m = re.match(r"(\d+)x(\d+)\s*px,\s*([\d.]+)\s*Hz(.*)", s)
+            if m:
+                mode = (int(m.group(1)), int(m.group(2)),
+                        round(float(m.group(3)), 3))
+                cur["modes"].append(mode)
+                if "current" in m.group(4):
+                    cur["current"] = mode
+    return outs
+
+
+def discover_map():
+    names = output_names()  # mango's view (mmsg -O)
+    parsed = parse_wlr_randr()
+    # union: trust wlr-randr's list, but keep anything mmsg reported too
+    all_names = list(dict.fromkeys(names + list(parsed.keys())))
+    mons = {n: Monitor(n) for n in all_names}
+
+    if parsed:
+        for n, mon in mons.items():
+            d = parsed.get(n)
+            if not d:
+                continue
+            mon.make = d.get("make", "")
+            mon.model = d.get("model", "")
+            mon.serial = d.get("serial", "")
+            mon.desc = d.get("desc", n)
+            mon.enabled = d.get("enabled", True)
+            mon.modes = d.get("modes", [])
+            if d.get("current"):
+                mon.width, mon.height, mon.refresh = d["current"]
+                mon.native = d["current"]
+            elif mon.modes:
+                mon.width, mon.height, mon.refresh = mon.modes[0]
+                mon.native = mon.modes[0]
+            if "pos" in d:
+                mon.x, mon.y = d["pos"]
+            if "scale" in d:
+                mon.scale = d["scale"]
+            if "transform" in d:
+                mon.transform = d["transform"]
+            if "vrr" in d:
+                mon.vrr = d["vrr"]
+        # wlr-randr gives live geometry, which already reflects any applied
+        # rules — use it as the source of truth (don't re-overlay config).
+    else:
+        # Fallback: wayland-info (no wlr-randr available).
+        seed_from_wayland_info(mons)
+        for rule in parse_saved_rules():
+            target = match_saved(rule, mons)
+            if target:
+                apply_saved(target, rule)
+
+    # If everything is stacked at the origin, fan them out left-to-right so the
+    # very first launch shows a sane editable layout instead of one pile.
+    enabled = [m for m in mons.values() if m.enabled]
+    if enabled and len({(m.x, m.y) for m in enabled}) == 1:
+        x = 0
+        for m in sorted(enabled, key=lambda m: m.name):
+            m.x, m.y = x, 0
+            x += m.logical_size()[0]
+
+    return mons
+
+
+def seed_from_wayland_info(mons):
+    info = run(["wayland-info"])
+    cur = None
+    for line in info.splitlines():
+        s = line.strip()
+        m = re.match(r"name:\s*(\S+)", s)
+        if m and m.group(1) in mons:
+            cur = mons[m.group(1)]
+            continue
+        if cur is None:
+            continue
+        if s.startswith("description:"):
+            cur.desc = s.split(":", 1)[1].strip()
+        elif s.startswith("make:"):
+            cur.make = s.split("'")[1] if "'" in s else ""
+        elif s.startswith("model:"):
+            cur.model = s.split("'")[1] if "'" in s else ""
+        m = re.search(
+            r"width:\s*(\d+)\s*px,\s*height:\s*(\d+)\s*px,\s*refresh:\s*([\d.]+)",
+            s)
+        if m and cur is not None:
+            cur.width = int(m.group(1))
+            cur.height = int(m.group(2))
+            cur.refresh = float(m.group(3))
+            cur.native = (cur.width, cur.height, cur.refresh)
+
+
+def parse_saved_rules():
+    if not os.path.exists(CONFIG):
+        return []
+    rules = []
+    for line in open(CONFIG):
+        line = line.strip()
+        if line.startswith("monitorrule="):
+            kv = {}
+            for tok in line[len("monitorrule="):].split(","):
+                if ":" in tok:
+                    k, v = tok.split(":", 1)
+                    kv[k.strip()] = v.strip()
+            rules.append(kv)
+    return rules
+
+
+def match_saved(rule, mons):
+    name = rule.get("name", "")
+    bare = name.strip("^$")
+    if bare in mons:
+        return mons[bare]
+    for n, mon in mons.items():
+        try:
+            if name and re.search(name, n):
+                return mon
+        except re.error:
+            pass
+    return None
+
+
+def apply_saved(mon, rule):
+    def num(key, cast, attr):
+        if key in rule:
+            try:
+                setattr(mon, attr, cast(rule[key]))
+            except ValueError:
+                pass
+    num("width", int, "width")
+    num("height", int, "height")
+    num("refresh", float, "refresh")
+    num("x", int, "x")
+    num("y", int, "y")
+    num("scale", float, "scale")
+    num("rr", int, "transform")
+    num("vrr", int, "vrr")
+
+
+def parse_saved_disabled():
+    """Names disabled via our managed exec-once block."""
+    if not os.path.exists(CONFIG):
+        return set()
+    text = open(CONFIG).read()
+    block = extract_block(text)
+    return set(re.findall(r"disable_monitor,([^\s']+)", block))
+
+
+def extract_block(text):
+    i = text.find(BEGIN)
+    j = text.find(END)
+    if i != -1 and j != -1 and j > i:
+        return text[i:j]
+    return ""
+
+
+# ----------------------------------------------------------------------------
+# Config writing
+# ----------------------------------------------------------------------------
+
+def build_block(monitors):
+    lines = [BEGIN]
+    for m in monitors:
+        if m.enabled:
+            lines.append(m.rule_line())
+    for m in monitors:
+        if not m.enabled:
+            # persist disable across restarts; small delay so output exists
+            lines.append(
+                f"exec-once=sh -c 'sleep 1; mmsg -d disable_monitor,{m.name}'"
+            )
+    lines.append(END)
+    return "\n".join(lines) + "\n"
+
+
+def write_config(monitors):
+    text = open(CONFIG).read() if os.path.exists(CONFIG) else ""
+    backup = CONFIG + ".bak-mango-monitors"
+    if os.path.exists(CONFIG) and not os.path.exists(backup):
+        shutil.copy2(CONFIG, backup)
+    block = build_block(monitors)
+
+    i = text.find(BEGIN)
+    j = text.find(END)
+    if i != -1 and j != -1 and j > i:
+        new = text[:i] + block + text[j + len(END):].lstrip("\n")
+    else:
+        sep = "" if text.endswith("\n") or not text else "\n"
+        new = text + sep + "\n" + block
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(new)
+    os.replace(tmp, CONFIG)
+
+
+def apply_live(monitors):
+    for m in monitors:
+        if m.enabled:
+            run(["mmsg", "-d", f"enable_monitor,{m.name}"])
+    run(["mmsg", "-d", "reload_config"])
+    for m in monitors:
+        if not m.enabled:
+            run(["mmsg", "-d", f"disable_monitor,{m.name}"])
+
+
+def normalize(monitors):
+    """Shift layout so the top-left enabled monitor sits at (0,0).
+    mango/XWayland misbehave with negative coordinates."""
+    en = [m for m in monitors if m.enabled]
+    if not en:
+        return
+    minx = min(m.x for m in en)
+    miny = min(m.y for m in en)
+    for m in en:
+        m.x -= minx
+        m.y -= miny
+
+
+# ----------------------------------------------------------------------------
+# Canvas — draggable monitor arrangement
+# ----------------------------------------------------------------------------
+
+class Canvas(Gtk.DrawingArea):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+        self.set_content_width(620)
+        self.set_content_height(340)
+        self.set_draw_func(self.draw)
+
+        self._scale = 1.0
+        self._ox = 0.0
+        self._oy = 0.0
+        self.drag_target = None
+        self.drag_start = None  # (orig_x, orig_y)
+
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self.on_begin)
+        drag.connect("drag-update", self.on_update)
+        drag.connect("drag-end", self.on_end)
+        self.add_controller(drag)
+
+        click = Gtk.GestureClick()
+        click.connect("pressed", self.on_click)
+        self.add_controller(click)
+
+    # world (layout px) <-> canvas px
+    def fit(self, width, height):
+        en = [m for m in self.app.monitors if m.enabled]
+        if not en:
+            self._scale = 1.0
+            self._ox = self._oy = 0.0
+            return
+        maxx = max(m.x + m.logical_size()[0] for m in en)
+        maxy = max(m.y + m.logical_size()[1] for m in en)
+        maxx = max(maxx, 1)
+        maxy = max(maxy, 1)
+        pad = 40
+        sx = (width - 2 * pad) / maxx
+        sy = (height - 2 * pad) / maxy
+        self._scale = min(sx, sy, 0.25)
+        self._ox = (width - maxx * self._scale) / 2
+        self._oy = (height - maxy * self._scale) / 2
+
+    def to_canvas(self, x, y):
+        return (self._ox + x * self._scale, self._oy + y * self._scale)
+
+    def to_world(self, cx, cy):
+        return ((cx - self._ox) / self._scale, (cy - self._oy) / self._scale)
+
+    def hit(self, cx, cy):
+        wx, wy = self.to_world(cx, cy)
+        for m in reversed(self.app.monitors):
+            if not m.enabled:
+                continue
+            w, h = m.logical_size()
+            if m.x <= wx <= m.x + w and m.y <= wy <= m.y + h:
+                return m
+        return None
+
+    def draw(self, area, cr, width, height, *_):
+        self.fit(width, height)
+        cr.set_source_rgb(*CANVAS_BG)
+        cr.paint()
+
+        for m in self.app.monitors:
+            if not m.enabled:
+                continue
+            w, h = m.logical_size()
+            x, y = self.to_canvas(m.x, m.y)
+            cw, chh = w * self._scale, h * self._scale
+            selected = (m is self.app.selected)
+
+            cr.rectangle(x + 2, y + 2, cw - 4, chh - 4)
+            if selected:
+                cr.set_source_rgba(*ACCENT, 0.18)
+            else:
+                cr.set_source_rgba(0.5, 0.5, 0.55, 0.10)
+            cr.fill()
+
+            cr.rectangle(x + 2, y + 2, cw - 4, chh - 4)
+            cr.set_line_width(3 if selected else 1.5)
+            cr.set_source_rgb(*(ACCENT if selected else ACCENT_DIM))
+            cr.stroke()
+
+            self._label(cr, m, x, y, cw, chh)
+
+        # disabled monitors as a little tray at the bottom
+        off = [m for m in self.app.monitors if not m.enabled]
+        if off:
+            tx = 12
+            for m in off:
+                cr.set_source_rgb(*DISABLED)
+                cr.rectangle(tx, height - 26, 90, 18)
+                cr.fill()
+                self._text(cr, f"{m.name} (off)", tx + 6, height - 22, 9,
+                           (1, 1, 1))
+                tx += 100
+
+    def _label(self, cr, m, x, y, cw, chh):
+        name = m.name
+        res = f"{m.width}×{m.height}"
+        extra = f"@{m.refresh:g}  ×{m.scale:g}"
+        if m.transform:
+            extra += "  ⟳"
+        self._text(cr, name, x + 10, y + 10, 14, (0.1, 0.12, 0.2), bold=True)
+        self._text(cr, res, x + 10, y + 30, 11, (0.25, 0.27, 0.35))
+        self._text(cr, extra, x + 10, y + 46, 10, (0.4, 0.42, 0.5))
+
+    def _text(self, cr, text, x, y, size, rgb, bold=False):
+        layout = self.create_pango_layout(text)
+        desc = Pango.FontDescription()
+        desc.set_size(int(size * Pango.SCALE))
+        if bold:
+            desc.set_weight(Pango.Weight.BOLD)
+        layout.set_font_description(desc)
+        cr.move_to(x, y)
+        cr.set_source_rgb(*rgb)
+        from gi.repository import PangoCairo
+        PangoCairo.show_layout(cr, layout)
+
+    # --- gestures ---
+    def on_click(self, gesture, n, cx, cy):
+        m = self.hit(cx, cy)
+        if m:
+            self.app.select(m)
+
+    def on_begin(self, gesture, sx, sy):
+        m = self.hit(sx, sy)
+        if m:
+            self.drag_target = m
+            self.drag_start = (m.x, m.y)
+            self.app.select(m)
+        else:
+            self.drag_target = None
+
+    def on_update(self, gesture, dx, dy):
+        if not self.drag_target:
+            return
+        wx = self.drag_start[0] + dx / self._scale
+        wy = self.drag_start[1] + dy / self._scale
+        self.drag_target.x = round(wx)
+        self.drag_target.y = round(wy)
+        self.snap(self.drag_target)
+        self.queue_draw()
+
+    def on_end(self, gesture, dx, dy):
+        if not self.drag_target:
+            return
+        normalize(self.app.monitors)
+        self.drag_target = None
+        self.app.refresh_fields()
+        self.queue_draw()
+
+    def snap(self, mon):
+        w, h = mon.logical_size()
+        others = [o for o in self.app.monitors if o is not mon and o.enabled]
+        # candidate x positions (edge-to-edge and aligned edges)
+        xs, ys = [0], [0]
+        for o in others:
+            ow, oh = o.logical_size()
+            xs += [o.x + ow, o.x - w, o.x, o.x + ow - w]
+            ys += [o.y + oh, o.y - h, o.y, o.y + oh - h]
+        for cand in xs:
+            if abs(mon.x - cand) <= SNAP:
+                mon.x = cand
+                break
+        for cand in ys:
+            if abs(mon.y - cand) <= SNAP:
+                mon.y = cand
+                break
+
+
+# ----------------------------------------------------------------------------
+# Main window
+# ----------------------------------------------------------------------------
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.app_ref = app
+        self.set_title("Mango Monitors")
+        self.set_default_size(940, 560)
+
+        self.monitors = discover()
+        self.selected = next((m for m in self.monitors if m.enabled), None)
+        self._updating = False
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+
+        ident = Gtk.Button(label="Identify")
+        ident.connect("clicked", self.on_identify)
+        header.pack_start(ident)
+
+        rescan = Gtk.Button(icon_name="view-refresh-symbolic")
+        rescan.set_tooltip_text("Re-scan connected monitors now")
+        rescan.connect("clicked", lambda *_: self.poll_outputs(force=True))
+        header.pack_start(rescan)
+
+        save_btn = Gtk.Button(label="Save")
+        save_btn.set_tooltip_text("Write monitorrule lines to config.conf "
+                                  "(persist, no live change)")
+        save_btn.connect("clicked", self.on_save)
+        header.pack_end(save_btn)
+
+        apply_btn = Gtk.Button(label="Apply")
+        apply_btn.add_css_class("suggested-action")
+        apply_btn.set_tooltip_text("Save and apply live via reload_config")
+        apply_btn.connect("clicked", self.on_apply)
+        header.pack_end(apply_btn)
+
+        toolbar.add_top_bar(header)
+
+        # body: canvas on top, controls below
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        self.canvas = Canvas(self)
+        frame = Gtk.Frame()
+        frame.set_child(self.canvas)
+        frame.set_margin_top(12)
+        frame.set_margin_start(12)
+        frame.set_margin_end(12)
+        body.append(frame)
+
+        hint = Gtk.Label(label="Drag monitors to arrange · click to select · "
+                               "edges snap automatically")
+        hint.add_css_class("dim-label")
+        hint.set_margin_top(4)
+        hint.set_margin_bottom(4)
+        body.append(hint)
+
+        self.controls = self.build_controls()
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_vexpand(True)
+        scroller.set_child(self.controls)
+        body.append(scroller)
+
+        toolbar.set_content(body)
+
+        self.toaster = Adw.ToastOverlay()
+        self.toaster.set_child(toolbar)
+        self.set_content(self.toaster)
+        self.refresh_fields()
+
+        # Hotplug: poll the live output set so connecting/disconnecting a
+        # monitor is reflected automatically (edits to still-present monitors
+        # are preserved).
+        self._known = {m.name for m in self.monitors}
+        self._poll_id = GLib.timeout_add_seconds(2, self.poll_outputs)
+
+    def build_controls(self):
+        clamp = Adw.Clamp()
+        clamp.set_maximum_size(720)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_margin_top(12)
+        box.set_margin_bottom(16)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+
+        group = Adw.PreferencesGroup()
+        self.group_title = group
+        group.set_title("Selected monitor")
+
+        self.enabled_sw = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.enabled_sw.connect("notify::active", self.on_enabled)
+        row = Adw.ActionRow(title="Enabled")
+        row.add_suffix(self.enabled_sw)
+        row.set_activatable_widget(self.enabled_sw)
+        group.add(row)
+
+        # resolution
+        self.res_combo = Gtk.DropDown.new_from_strings([])
+        self.res_combo.set_valign(Gtk.Align.CENTER)
+        self.res_combo.connect("notify::selected", self.on_res)
+        rr = Adw.ActionRow(title="Resolution")
+        rr.add_suffix(self.res_combo)
+        group.add(rr)
+
+        # refresh
+        self.refresh_spin = Gtk.SpinButton.new_with_range(20, 360, 0.001)
+        self.refresh_spin.set_digits(3)
+        self.refresh_spin.set_valign(Gtk.Align.CENTER)
+        self.refresh_spin.connect("value-changed", self.on_refresh)
+        rfr = Adw.ActionRow(title="Refresh (Hz)")
+        rfr.add_suffix(self.refresh_spin)
+        group.add(rfr)
+
+        # scale
+        self.scale_spin = Gtk.SpinButton.new_with_range(0.5, 3.0, 0.05)
+        self.scale_spin.set_digits(2)
+        self.scale_spin.set_value(1.0)
+        self.scale_spin.set_valign(Gtk.Align.CENTER)
+        self.scale_spin.connect("value-changed", self.on_scale)
+        sc = Adw.ActionRow(title="Scale")
+        sc.add_suffix(self.scale_spin)
+        group.add(sc)
+
+        # rotation
+        self.rot_combo = Gtk.DropDown.new_from_strings(
+            [lbl for _, lbl in TRANSFORMS])
+        self.rot_combo.set_valign(Gtk.Align.CENTER)
+        self.rot_combo.connect("notify::selected", self.on_rot)
+        rt = Adw.ActionRow(title="Rotation")
+        rt.add_suffix(self.rot_combo)
+        group.add(rt)
+
+        # vrr
+        self.vrr_sw = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.vrr_sw.connect("notify::active", self.on_vrr)
+        vr = Adw.ActionRow(
+            title="Variable refresh (VRR)",
+            subtitle="Adaptive sync / FreeSync, if the panel supports it")
+        vr.add_suffix(self.vrr_sw)
+        vr.set_activatable_widget(self.vrr_sw)
+        group.add(vr)
+
+        # position (editable, also set by dragging)
+        self.posx = Gtk.SpinButton.new_with_range(0, 99999, 1)
+        self.posy = Gtk.SpinButton.new_with_range(0, 99999, 1)
+        for sp, cb in ((self.posx, self.on_posx), (self.posy, self.on_posy)):
+            sp.set_valign(Gtk.Align.CENTER)
+            sp.connect("value-changed", cb)
+        px = Adw.ActionRow(title="Position X")
+        px.add_suffix(self.posx)
+        py = Adw.ActionRow(title="Position Y")
+        py.add_suffix(self.posy)
+        group.add(px)
+        group.add(py)
+
+        box.append(group)
+
+        # custom mode entry
+        cgroup = Adw.PreferencesGroup()
+        cgroup.set_title("Custom mode")
+        cgroup.set_description(
+            "If your resolution isn't listed, type it here. mango will request "
+            "a custom mode (may not work on every panel).")
+        self.custom_entry = Gtk.Entry()
+        self.custom_entry.set_placeholder_text("e.g. 2560x1440@144")
+        self.custom_entry.set_valign(Gtk.Align.CENTER)
+        apply_custom = Gtk.Button(label="Set")
+        apply_custom.set_valign(Gtk.Align.CENTER)
+        apply_custom.connect("clicked", self.on_custom)
+        crow = Adw.ActionRow(title="Mode")
+        crow.add_suffix(self.custom_entry)
+        crow.add_suffix(apply_custom)
+        cgroup.add(crow)
+        box.append(cgroup)
+
+        clamp.set_child(box)
+        return clamp
+
+    # --- selection / field sync ---
+    def select(self, mon):
+        self.selected = mon
+        self.refresh_fields()
+        self.canvas.queue_draw()
+
+    def res_options(self, mon):
+        opts = []
+        seen = set()
+        sources = list(mon.modes) or [mon.native]
+        sources = sources + [(mon.width, mon.height, mon.refresh)]
+        for w, h, _ in sources:
+            key = (w, h)
+            if key not in seen:
+                seen.add(key)
+                opts.append(key)
+        return opts
+
+    def best_refresh(self, mon, w, h):
+        rates = [r for (mw, mh, r) in mon.modes if (mw, mh) == (w, h)]
+        return max(rates) if rates else mon.refresh
+
+    def refresh_fields(self):
+        self._updating = True
+        m = self.selected
+        if m is None:
+            self.group_title.set_title("No monitor selected")
+            self._updating = False
+            return
+        self.group_title.set_title(m.name)
+        self.group_title.set_description(
+            f"{m.make} {m.model}".strip() or m.desc)
+
+        self.enabled_sw.set_active(m.enabled)
+
+        opts = self.res_options(m)
+        self._res_opts = opts
+        model = Gtk.StringList.new([f"{w} × {h}" for w, h in opts])
+        self.res_combo.set_model(model)
+        cur = (m.width, m.height)
+        self.res_combo.set_selected(opts.index(cur) if cur in opts else 0)
+
+        self.refresh_spin.set_value(m.refresh)
+        self.scale_spin.set_value(m.scale)
+        self.rot_combo.set_selected(
+            next(i for i, (c, _) in enumerate(TRANSFORMS) if c == m.transform))
+        self.vrr_sw.set_active(bool(m.vrr))
+        self.posx.set_value(m.x)
+        self.posy.set_value(m.y)
+
+        for w in (self.res_combo, self.refresh_spin, self.scale_spin,
+                  self.rot_combo, self.vrr_sw, self.posx, self.posy):
+            w.set_sensitive(m.enabled)
+        self._updating = False
+
+    # --- control callbacks ---
+    def on_enabled(self, sw, _):
+        if self._updating or not self.selected:
+            return
+        self.selected.enabled = sw.get_active()
+        if self.selected.enabled:
+            normalize(self.monitors)
+        self.refresh_fields()
+        self.canvas.queue_draw()
+
+    def on_res(self, combo, _):
+        if self._updating or not self.selected:
+            return
+        idx = combo.get_selected()
+        if 0 <= idx < len(self._res_opts):
+            w, h = self._res_opts[idx]
+            self.selected.width, self.selected.height = w, h
+            # snap refresh to the best rate this resolution supports
+            self.selected.refresh = self.best_refresh(self.selected, w, h)
+            self._updating = True
+            self.refresh_spin.set_value(self.selected.refresh)
+            self._updating = False
+            normalize(self.monitors)
+            self.canvas.queue_draw()
+
+    def on_refresh(self, spin):
+        if self._updating or not self.selected:
+            return
+        self.selected.refresh = spin.get_value()
+        self.canvas.queue_draw()
+
+    def on_scale(self, spin):
+        if self._updating or not self.selected:
+            return
+        self.selected.scale = round(spin.get_value(), 2)
+        normalize(self.monitors)
+        self.canvas.queue_draw()
+
+    def on_rot(self, combo, _):
+        if self._updating or not self.selected:
+            return
+        self.selected.transform = TRANSFORMS[combo.get_selected()][0]
+        normalize(self.monitors)
+        self.canvas.queue_draw()
+
+    def on_vrr(self, sw, _):
+        if self._updating or not self.selected:
+            return
+        self.selected.vrr = 1 if sw.get_active() else 0
+
+    def on_posx(self, spin):
+        if self._updating or not self.selected:
+            return
+        self.selected.x = int(spin.get_value())
+        self.canvas.queue_draw()
+
+    def on_posy(self, spin):
+        if self._updating or not self.selected:
+            return
+        self.selected.y = int(spin.get_value())
+        self.canvas.queue_draw()
+
+    def on_custom(self, _btn):
+        if not self.selected:
+            return
+        text = self.custom_entry.get_text().strip().lower()
+        m = re.match(r"(\d+)\s*[x×]\s*(\d+)(?:@([\d.]+))?", text)
+        if not m:
+            self.toast("Couldn't parse — use WxH or WxH@Hz")
+            return
+        self.selected.width = int(m.group(1))
+        self.selected.height = int(m.group(2))
+        if m.group(3):
+            self.selected.refresh = float(m.group(3))
+        self.refresh_fields()
+        self.canvas.queue_draw()
+
+    # --- actions ---
+    def on_identify(self, _btn):
+        # flash each enabled monitor's name big, centered, briefly
+        for m in self.monitors:
+            if not m.enabled:
+                continue
+            try:
+                subprocess.Popen([
+                    "notify-send", "-t", "2000",
+                    f"🖥  {m.name}",
+                    f"{m.width}×{m.height} @ {m.refresh:g}Hz  ·  "
+                    f"pos {m.x},{m.y}",
+                ])
+            except Exception:
+                pass
+        self.toast("Sent identify notifications to each monitor")
+
+    def on_save(self, _btn):
+        normalize(self.monitors)
+        try:
+            write_config(self.monitors)
+            self.toast("Saved to config.conf")
+        except Exception as e:
+            self.toast(f"Save failed: {e}")
+        self.refresh_fields()
+
+    def on_apply(self, _btn):
+        normalize(self.monitors)
+        try:
+            write_config(self.monitors)
+        except Exception as e:
+            self.toast(f"Write failed: {e}")
+            return
+        # snapshot for revert (the file we just overwrote's prior managed block
+        # is gone, but a full backup exists; for revert we restore previous
+        # in-memory geometry by re-discovering before apply)
+        apply_live(self.monitors)
+        self.confirm_keep()
+
+    def confirm_keep(self):
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Keep this arrangement?",
+            body="Reverting in 15 seconds if you don't confirm.",
+        )
+        dialog.add_response("revert", "Revert")
+        dialog.add_response("keep", "Keep Changes")
+        dialog.set_response_appearance("keep",
+                                       Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("keep")
+        dialog.set_close_response("revert")
+
+        state = {"id": None, "left": 15}
+
+        def tick():
+            state["left"] -= 1
+            dialog.set_body(
+                f"Reverting in {state['left']} seconds if you don't confirm.")
+            if state["left"] <= 0:
+                dialog.response("revert")
+                return False
+            return True
+
+        state["id"] = GLib.timeout_add_seconds(1, tick)
+
+        def on_resp(dlg, resp):
+            if state["id"]:
+                GLib.source_remove(state["id"])
+                state["id"] = None
+            if resp == "revert":
+                self.revert()
+            dlg.destroy()
+
+        dialog.connect("response", on_resp)
+        dialog.present()
+
+    def revert(self):
+        # restore previous config from backup-of-this-run, then reload
+        self.monitors = discover_previous()
+        try:
+            write_config(self.monitors)
+        except Exception:
+            pass
+        apply_live(self.monitors)
+        self.selected = next((m for m in self.monitors if m.enabled), None)
+        self.refresh_fields()
+        self.canvas.queue_draw()
+        self.toast("Reverted")
+
+    def toast(self, text):
+        try:
+            self.toaster.add_toast(Adw.Toast.new(text))
+        except Exception:
+            print(text, file=sys.stderr)
+
+    # --- hotplug ---
+    def poll_outputs(self, force=False):
+        """Reflect monitors being plugged in / unplugged. Returns True so the
+        GLib timer keeps firing."""
+        current = set(output_names())
+        if not force and current == self._known:
+            return True
+
+        fresh = discover_map()  # live geometry for any new outputs
+        added = current - self._known
+        removed = self._known - current
+
+        # keep the existing monitor objects (so in-progress edits survive) for
+        # outputs that are still present; drop the ones that went away.
+        kept = [m for m in self.monitors if m.name in current]
+
+        # append newly-connected outputs, placed to the right to avoid overlap
+        if kept:
+            rightmost = max(
+                (m.x + m.logical_size()[0] for m in kept if m.enabled),
+                default=0)
+        else:
+            rightmost = 0
+        for name in sorted(added):
+            nm = fresh.get(name) or Monitor(name)
+            nm.x, nm.y = rightmost, 0
+            rightmost += nm.logical_size()[0]
+            kept.append(nm)
+
+        self.monitors = kept
+        self._known = current
+
+        if self.selected is None or self.selected.name not in current:
+            self.selected = next(
+                (m for m in self.monitors if m.enabled),
+                self.monitors[0] if self.monitors else None)
+
+        normalize(self.monitors)
+        self.refresh_fields()
+        self.canvas.queue_draw()
+
+        parts = []
+        if added:
+            parts.append("connected " + ", ".join(sorted(added)))
+        if removed:
+            parts.append("disconnected " + ", ".join(sorted(removed)))
+        if parts:
+            self.toast("Monitors: " + "; ".join(parts))
+        elif force:
+            self.toast("No monitor changes")
+        return True
+
+
+# previous-state snapshot for revert: captured at startup
+_PREVIOUS = None
+
+
+def discover_previous():
+    global _PREVIOUS
+    return _PREVIOUS if _PREVIOUS else discover()
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="io.github.slapah.MangoMonitors")
+
+    def do_activate(self):
+        win = Window(self)
+        win.present()
+
+
+def main():
+    global _PREVIOUS
+    # capture pre-edit state once for revert
+    _PREVIOUS = discover()
+    app = App()
+    return app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

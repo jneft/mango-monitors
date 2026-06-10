@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Mango Monitors
+Comment=Arrange your displays under MangoWM
+Exec=mango-monitors
+Icon=preferences-desktop-display
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=monitor;display;screen;layout;resolution;mango;wayland;
